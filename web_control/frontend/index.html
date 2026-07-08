@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>云台追踪 · Web 控制台</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC",
+         "Microsoft YaHei", system-ui, sans-serif;
+         background: #0f1115; color: #e6e6e6; margin: 0; padding: 16px; }
+  h1 { font-size: 18px; margin: 0 0 12px; font-weight: 600; }
+  h1 small { color: #888; font-weight: 400; font-size: 12px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-start; }
+  .video { background:#000; border:1px solid #2a2d35; border-radius: 8px;
+           overflow: hidden; }
+  .video img { display:block; max-width: 100%; }
+  .panel { background:#161922; border:1px solid #2a2d35; border-radius:8px;
+           padding:12px 14px; min-width: 200px; }
+  .panel h2 { font-size: 13px; margin: 0 0 10px; color: #9bd1ff;
+              font-weight: 600; letter-spacing: .5px; text-transform: uppercase; }
+  button { background:#2d6cdf; color:#fff; border:0; padding:7px 12px;
+           border-radius:6px; cursor:pointer; margin:3px;
+           font-size: 13px; transition: background .15s; }
+  button:hover { background:#3a7be5; }
+  button.alt { background:#444c5e; }
+  button.alt:hover { background:#535c70; }
+  button.danger { background:#c0394a; }
+  button.danger:hover { background:#d04a5b; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .pad { display:grid; grid-template-columns: 52px 52px 52px;
+         grid-template-rows: 38px 38px 38px; gap:4px; margin-bottom:6px; }
+  .pad button { margin:0; font-size:16px; padding:0; }
+  .status { font-family: ui-monospace, "SF Mono", Consolas, monospace;
+            font-size: 13px; line-height:1.85; }
+  .ok { color: #6ee07a; }
+  .no { color: #ff7474; }
+  .rec-list { max-height: 240px; overflow:auto; font-size: 13px; }
+  .rec-list a { color:#9bd1ff; text-decoration:none; display:block;
+                padding:5px 0; border-bottom:1px dashed #2a2d35; }
+  .rec-list a:hover { color:#c8e6ff; text-decoration:underline; }
+  .empty { color:#777; font-style: italic; }
+</style>
+</head>
+<body>
+  <h1>🤖 云台追踪 · Web 控制台 <small id="addr"></small></h1>
+  <div class="row">
+    <div class="video">
+      <img id="feed" src="/video_feed" alt="live" width="640">
+    </div>
+
+    <div class="panel" style="min-width:180px">
+      <h2>状态</h2>
+      <div class="status" id="status">加载中…</div>
+    </div>
+
+    <div class="panel">
+      <h2>自动追踪</h2>
+      <button onclick="trackingStart()">▶ 开始追踪</button>
+      <button class="danger" onclick="trackingStop()">■ 停止追踪</button>
+      <p style="margin:8px 0 0;font-size:12px;color:#888">
+        ON 时云台会自动跟随画面中最大的人物框。
+      </p>
+    </div>
+
+    <div class="panel">
+      <h2>手动云台</h2>
+      <div class="pad">
+        <div></div>
+        <button onclick="move(0,15)"  title="上 (pitch up)">▲</button>
+        <div></div>
+        <button onclick="move(-15,0)" title="左 (yaw 左转)">◀</button>
+        <button class="danger" onclick="gimbalStop()" title="停止">■</button>
+        <button onclick="move(15,0)"  title="右">▶</button>
+        <div></div>
+        <button onclick="move(0,-15)" title="下">▼</button>
+        <div></div>
+      </div>
+      <small style="color:#888">每次 0.3s，按一下动一下。</small>
+    </div>
+
+    <div class="panel" style="min-width:260px">
+      <h2>最近录像 <button class="alt" style="float:right;padding:3px 8px;font-size:12px"
+                  onclick="loadRec()">刷新</button></h2>
+      <div class="rec-list" id="recs">加载中…</div>
+      <p style="margin:8px 0 0;font-size:12px;color:#888">
+        录像保存在板端 <code>/root/web_control/logs/</code>。
+      </p>
+    </div>
+  </div>
+
+<script>
+const $ = id => document.getElementById(id);
+async function api(path, opts={}) {
+  try {
+    const r = await fetch(path, opts);
+    return await r.json();
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
+
+async function trackingStart() { await api('/api/tracking/start', {method:'POST'}); refresh(); }
+async function trackingStop()  { await api('/api/tracking/stop',  {method:'POST'}); refresh(); }
+async function gimbalStop()    { await api('/api/gimbal/stop',    {method:'POST'}); refresh(); }
+async function move(yaw, pitch) {
+  await api('/api/gimbal/manual', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({yaw, pitch, duration: 0.3})
+  });
+}
+
+async function loadRec() {
+  const j = await api('/api/recordings');
+  const el = $('recs');
+  if (!j || !Array.isArray(j) || !j.length) {
+    el.innerHTML = '<div class="empty">暂无录像</div>'; return;
+  }
+  el.innerHTML = j.map(r => {
+    const kb = (r.size/1024).toFixed(1);
+    const t  = new Date(r.mtime*1000).toLocaleString();
+    return `<a href="${r.url}" target="_blank">▶ ${r.name}<br>
+            <span style="color:#666;font-size:11px">${kb} KB · ${t}</span></a>`;
+  }).join('');
+}
+
+async function refresh() {
+  const j = await api('/api/status');
+  const cls = ok => ok ? 'ok' : 'no';
+  if (!j || j.error) {
+    $('status').innerHTML = '<span class="no">后端无响应</span>';
+    return;
+  }
+  $('status').innerHTML = `
+    摄像头: <span class="${cls(j.camera)}">${j.camera?'OK':'NO'}</span><br>
+    AI 模型: <span class="${cls(j.ai)}">${j.ai?'OK':'NO'}</span><br>
+    云台串口: <span class="${cls(j.gimbal)}">${j.gimbal?'OK':'NO'}</span><br>
+    追踪: <span class="${cls(j.tracking)}">${j.tracking?'ON':'OFF'}</span><br>
+    FPS: ${j.fps}　<br>
+    检测: ${j.det?'<span class="ok">已锁定</span>':'<span class="no">未锁定</span>'}<br>
+    ${j.error ? `<span class="no">${j.error}</span>` : ''}
+  `;
+}
+
+$('addr').textContent = `(${location.host})`;
+refresh(); loadRec();
+setInterval(refresh, 1500);
+setInterval(loadRec, 8000);
+</script>
+</body>
+</html>
