@@ -38,6 +38,13 @@ UVC_CTRLS = {"zoom_absolute":(0,260),"focus_absolute":(0,160),"focus_automatic_c
 os.makedirs(RECORD_DIR, exist_ok=True)
 
 _lock = threading.Lock()
+_frame_lock = threading.Lock()  # 保护 _latest_frame (raw BGR ndarray, 追踪线程写, BPU/render 线程读)
+_latest_frame = None            # raw BGR ndarray, 追踪主线程写, render_loop/bpu_loop 读
+_bboxes_lock = threading.Lock()  # 保护 _latest_bboxes 和 _detect_busy
+_detect_pending_n = 0            # 待 detect 的 _n_frame (主循环写, detect 读)
+_detect_busy = False             # BPU detect 线程是否在跑
+_detect_event = threading.Event()  # 通知 detect 线程有新任务
+_last_bpu = -1                   # 上次 BPU 完成时的 _n_frame (模块级, detect 写, 主循环读)
 _tracking = True; _target_cls = "person"
 _manual_mode = False; _manual_last_time = 0.0
 _manual_no_timeout = False  # True=智能家居模式, 手动永不超时
@@ -825,75 +832,125 @@ def _laser_draw_pattern(name, total_dur=LASER_DEFAULT_DUR):
         _manual_mode = saved_manual   # 恢复追踪
         _laser_drawing = False
 
+def detect_loop():
+    """独立 BPU 检测线程 (A1 拆分), 不阻塞 detection_loop.
+    主循环每 N_DETECT 帧 set _detect_event. 本线程等事件 -> 跑 _det.detect (500-600ms) -> 写 _latest_bboxes -> 清 _detect_busy."""
+    global _latest_bboxes, _last_bpu, _bpu_last_fps, _detect_busy, _bboxes_lock, _frame_lock, _latest_frame, _detect_pending_n
+    bpu_c = 0
+    bpu_t0 = time.monotonic()
+    while True:
+        _detect_event.wait()
+        _detect_event.clear()
+        with _bboxes_lock:
+            if not _detect_busy:
+                continue
+            n_pending = _detect_pending_n
+        # 用 _latest_frame 当前帧做 BPU (主循环每帧都在写最新 frame)
+        with _frame_lock:
+            f = _latest_frame
+        if f is None:
+            with _bboxes_lock:
+                _detect_busy = False
+            continue
+        try:
+            lb, r, dx, dy = letterbox(f, 640)
+            nv12 = bgr_to_nv12(lb)
+            pred = _det.detect(nv12)
+            new_ob = [((x1-dx)/r, (y1-dy)/r, (x2-dx)/r, (y2-dy)/r, conf, int(cls))
+                      for x1, y1, x2, y2, conf, cls in pred]
+            with _bboxes_lock:
+                _latest_bboxes = new_ob
+                _detect_busy = False
+                _last_bpu = n_pending
+            bpu_c += 1
+        except Exception as e:
+            print(f"[detect] FAIL: {e}")
+            with _bboxes_lock:
+                _detect_busy = False
+        if time.monotonic() - bpu_t0 >= 1.0:
+            _bpu_last_fps = bpu_c / (time.monotonic() - bpu_t0)
+            bpu_t0 = time.monotonic()
+            bpu_c = 0
+
+def render_loop():
+    """独立 JPEG 渲染线程 (A1 拆分), 10fps 给前端 /frame.jpg.
+    每 100ms 从 _latest_frame 拿最新 frame -> cv2.imencode JPEG -> 写 _latest_jpeg.
+    不画任何 overlay (前端自己画)."""
+    global _latest_jpeg, _frame_lock, _latest_frame, _lock
+    while True:
+        time.sleep(0.1)  # 10fps
+        with _frame_lock:
+            frame = _latest_frame
+        if frame is None:
+            continue
+        try:
+            ret, j = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+            if ret:
+                with _lock:
+                    _latest_jpeg = j.tobytes()
+        except Exception as e:
+            print(f"[render] FAIL: {e}")
+
 def detection_loop():
-    global _n_frame, _capture_actual_fps, _bpu_last_fps, _latest_jpeg, _latest_bboxes,_capture_actual_fps,_bpu_last_fps,_ever_tracked,_n_frame,_lost_streak
-    global _v4l2_recording, _ffmpeg_frame_buf, _ffmpeg_proc, _ever_tracked, _tracked_targets, _next_target_id, _primary_id, _track_state, _hold_counter, _ema_cx, _ema_cy, _ema_initialized, _last_yaw, _last_pitch
-    sec_c=0; sec_t0=time.monotonic(); bpu_c=0; bpu_t0=time.monotonic(); last_bpu=-1
-    cx_ema,cy_ema=0.0,0.0; ema_init=False; _ever_tracked=False
+    """追踪主循环 (A1 拆分): 只做 cap.read + ByteTracker.update (空检测也调, 让 Kalman 预测) + PID.
+    不画 overlay, 不编码 JPEG, 不调 BPU (BPU 异步跑在 detect_loop).
+    共享 frame 给 render_loop, 共享 _latest_bboxes (从 detect_loop 来).
+    频率 = cap 硬件上限 (30fps), 不再被 BPU 600ms 阻塞."""
+    global _n_frame, _capture_actual_fps, _bpu_last_fps, _latest_frame, _latest_bboxes
+    global _v4l2_recording, _ever_tracked, _track_state, _hold_counter, _ema_cx, _ema_cy, _ema_initialized, _last_yaw, _last_pitch
+    global _last_bpu, _bboxes_lock, _detect_busy, _detect_pending_n, _detect_event
+    sec_c = 0; sec_t0 = time.monotonic()
+    _ever_tracked = False
     while True:
         if _v4l2_recording or _cap is None or not _cap.isOpened():
             time.sleep(0.05); continue
-        ok,frame=_cap.read()
+        ok, frame = _cap.read()
         if not ok: time.sleep(0.001); continue
-        _n_frame+=1
-        oboxes=_latest_bboxes; need_detect=(_n_frame-last_bpu)>=N_DETECT
-        if need_detect:
-            lb,r,dx,dy=letterbox(frame,640); nv12=bgr_to_nv12(lb); pred=_det.detect(nv12)
-            new_ob=[((x1-dx)/r,(y1-dy)/r,(x2-dx)/r,(y2-dy)/r,conf,int(cls)) for x1,y1,x2,y2,conf,cls in pred]
-            _latest_bboxes=new_ob; oboxes=new_ob; last_bpu=_n_frame; bpu_c+=1
-        yaw_s,pitch_s=0.0,0.0; target_seen=False
-        # 绘制所有检测框
-        for x1,y1,x2,y2,conf,cls in oboxes:
-            ci=int(cls); cn=COCO[ci]
-            cv2.rectangle(frame,(int(x1),int(y1)),(int(x2),int(y2)),(0,255,0) if cn=="person" else (255,0,0),2)
-            cv2.putText(frame,f"{cn} {conf:.2f}",(int(x1),max(15,int(y1)-10)),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,255,0) if cn=="person" else (255,0,0),2)
-        # 多目标追踪: ByteTrack (Kalman 滤波 + IoU 匹配, 解决 EMA 滞后和过冲)
-        if _tracking and not _manual_mode and _byte_tracker is not None and oboxes:
-            # 只追踪指定类别 (TRACK_CLASSES), 忽略椅子/杯子/手机等
+        _n_frame += 1
+        # 1) 共享 frame 给 render_loop + detect_loop
+        with _frame_lock:
+            global _latest_frame; _latest_frame = frame
+        # 2) 每 N_DETECT 帧触发 BPU 异步 (只在 detect 闲时塞, 否则跳过本帧)
+        if _n_frame - _last_bpu >= N_DETECT:
+            with _bboxes_lock:
+                if not _detect_busy:
+                    _detect_pending_n = _n_frame
+                    _detect_busy = True
+                    _detect_event.set()
+        # 3) 读最新检测结果 (主循环不依赖 BPU 完成)
+        with _bboxes_lock:
+            oboxes = list(_latest_bboxes) if _latest_bboxes else []
+        # 4) ByteTracker 每帧 update (空检测也调, Kalman 预测填补)
+        yaw_s, pitch_s = 0.0, 0.0; target_seen = False
+        if _tracking and not _manual_mode and _byte_tracker is not None:
             filtered = []
-            for x1,y1,x2,y2,conf,cls in oboxes:
+            for x1, y1, x2, y2, conf, cls in oboxes:
                 ci = int(cls)
                 if 0 <= ci < len(COCO) and COCO[ci] in TRACK_CLASSES:
-                    filtered.append((x1,y1,x2,y2,conf,cls))
-            tracks_out = np.array([])  # ByteTrack 输出 [N,7]: x1,y1,x2,y2,track_id,cls,score
+                    filtered.append((x1, y1, x2, y2, conf, cls))
             if filtered:
-                dets_np = np.array(filtered, dtype=np.float32)  # (N, 6)
+                dets_np = np.array(filtered, dtype=np.float32)
                 dets_t = torch.from_numpy(dets_np)
-                tracks_out = _byte_tracker.update(dets_t, None)
+            else:
+                # 传空张量让 ByteTrack 内部走 Kalman 预测
+                dets_t = torch.zeros((0, 6), dtype=torch.float32)
+            tracks_out = _byte_tracker.update(dets_t, None)
             if len(tracks_out) > 0:
-                # 选 score 最高的目标作为 primary
                 best_idx = int(np.argmax(tracks_out[:, 6]))
                 x1, y1, x2, y2, tid, cls, score = tracks_out[best_idx]
                 cx = float((x1 + x2) / 2.0)
                 cy = float((y1 + y2) / 2.0)
-                # ByteTrack 已经用 Kalman 平滑+预测, 直接给状态机用
                 yaw_s, pitch_s, target_seen = _compute_track_command(cx, cy)
                 if target_seen:
                     _ever_tracked = True
-                # 绘制所有跟踪目标框
-                for row in tracks_out:
-                    rx1, ry1, rx2, ry2 = row[:4]
-                    cv2.rectangle(frame,(int(rx1),int(ry1)),(int(rx2),int(ry2)),(255,255,0),2)
-                    cv2.putText(frame,f"#{int(row[4])} {row[6]:.2f}",(int(rx1),int(ry1)-5),
-                                cv2.FONT_HERSHEY_SIMPLEX,0.4,(255,255,0),1)
-                # 主目标特殊标记
-                cv2.circle(frame,(int(cx),int(cy)),8,(0,255,255),2)
-                cv2.putText(frame,f"PRIMARY ID={int(tid)} conf={score:.2f}",
-                            (int(cx)+10,int(cy)-10),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,255,255),2)
         if _manual_mode and check_manual_timeout(): print("[track] manual timeout->auto")
-        if target_seen and not _manual_mode and _gim: _gim.send(yaw_s,pitch_s)
-        elif not target_seen and not _manual_mode and _gim: _gim.send(0,0)
-        cv2.circle(frame,(TARGET_X,TARGET_Y),5,(0,255,255),-1)
-        _state_labels = {STATE_IDLE:"IDLE", STATE_TRACKING:"TRACK", STATE_HOLDING:"HOLD"}
-        cv2.putText(frame,f"STATE: {_state_labels.get(_track_state,'?')}/{'OK' if target_seen else 'LOST'} yaw={yaw_s:+.2f} pitch={pitch_s:+.2f} capture={_capture_actual_fps:.1f}fps bpu={_bpu_last_fps:.1f}fps",(8,CAM_H-48),cv2.FONT_HERSHEY_SIMPLEX,0.55,(0,255,0) if target_seen else (0,0,255),2)
-        cv2.putText(frame,f"kp={KP} dz={DEAD_ZONE} max={MAX_SPEED} det={len(oboxes)} frame={_n_frame}",(8,CAM_H-22),cv2.FONT_HERSHEY_SIMPLEX,0.45,(200,200,200),1)
-        ret,j=cv2.imencode(".jpg",frame,[cv2.IMWRITE_JPEG_QUALITY,JPEG_QUALITY])
-        if ret:
-            with _lock: _latest_jpeg=j.tobytes()
-        sec_c+=1
-        if time.monotonic()-sec_t0>=1.0:
-            _capture_actual_fps=sec_c/(time.monotonic()-sec_t0); sec_t0=time.monotonic(); sec_c=0
-            if bpu_c>0: _bpu_last_fps=bpu_c/(time.monotonic()-bpu_t0); bpu_t0=time.monotonic(); bpu_c=0
+        if target_seen and not _manual_mode and _gim: _gim.send(yaw_s, pitch_s)
+        elif not target_seen and not _manual_mode and _gim: _gim.send(0, 0)
+        sec_c += 1
+        if time.monotonic() - sec_t0 >= 1.0:
+            _capture_actual_fps = sec_c / (time.monotonic() - sec_t0)
+            sec_t0 = time.monotonic()
+            sec_c = 0
 
 def main():
     global _cap, _det, _gim
@@ -915,7 +972,10 @@ def main():
     except Exception as e:
         print(f"[gim] init failed: {e}, gimbal disabled")
         _gim=None
+    # A1 拆分: 启动 3 个独立线程 (追踪 / 渲染 / BPU 异步)
+    threading.Thread(target=detect_loop, daemon=True).start()
     threading.Thread(target=detection_loop, daemon=True).start()
+    threading.Thread(target=render_loop, daemon=True).start()
     # 关键: ThreadingHTTPServer 让 /audio_stream /video_feed 等长连接 handler 不阻塞 /frame.jpg /其它端点
     sv=ThreadingHTTPServer(("0.0.0.0",PORT),Handler)
     print(f"[track] yuntai.py PID: target=({TARGET_X},{TARGET_Y}) kp={KP} dz={DEAD_ZONE} max={MAX_SPEED}")
